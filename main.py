@@ -11,7 +11,7 @@ import requests
 app = FastAPI()
 
 # 🔗 BACKEND URL
-BACKEND_URL = "https://wiring-amy-senior-entrance.trycloudflare.com"
+BACKEND_URL = "https://coordinate-gone-bull-sao.trycloudflare.com"
 
 # 🚀 REGISTER FUNKSIYA
 def register():
