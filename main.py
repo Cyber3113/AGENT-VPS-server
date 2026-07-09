@@ -1,10 +1,12 @@
 from fastapi import FastAPI
 from executor import (
     check_path,
+    check_backend_path,
     npm_install,
     build_project,
     resolve_domain,
-    deploy_frontend
+    deploy_frontend,
+    deploy_backend,
 )
 import requests
 
@@ -37,6 +39,11 @@ def check(data: dict):
     path = data.get("path")
     return check_path(path)
 
+@app.post("/check-backend-path")
+def check_backend(data: dict):
+    path = data.get("path")
+    return check_backend_path(path)
+
 @app.post("/npm-install")
 def install(data: dict):
     path = data.get("path")
@@ -56,6 +63,13 @@ def check_domain_api(data: dict):
 def deploy_frontend_api(data: dict):
 
     return deploy_frontend(
+        data["path"],
+        data["domain"]
+    )
+
+@app.post("/deploy-backend")
+def deploy_backend_api(data: dict):
+    return deploy_backend(
         data["path"],
         data["domain"]
     )

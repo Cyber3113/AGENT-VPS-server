@@ -1,10 +1,211 @@
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
+from pathlib import Path
+
 import requests
 
 from utils import run_command
+
+
+def build_result(success: bool, msg: str, **extra):
+    payload = {
+        "status": success,
+        "success": success,
+        "msg": msg,
+    }
+    payload.update(extra)
+    return payload
+
+
+def normalize_path(path: str):
+    return str(Path(path).expanduser().resolve())
+
+
+def is_ignored_path(path: Path):
+    ignored_parts = {".venv", "venv", "env", "site-packages", "__pycache__"}
+    return any(part in ignored_parts for part in path.parts)
+
+
+def find_first_file(base: Path, filename: str):
+    direct = base / filename
+    if direct.exists():
+        return direct
+
+    candidates = [
+        item for item in base.rglob(filename)
+        if item.is_file() and not is_ignored_path(item)
+    ]
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (len(item.parts), str(item)))
+    return candidates[0]
+
+
+def find_python_bin(project_root: Path):
+    candidates = [
+        project_root / ".venv" / "bin" / "python",
+        project_root / "venv" / "bin" / "python",
+        project_root / "env" / "bin" / "python",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return shutil.which("python3") or shutil.which("python") or "python3"
+
+
+def parse_settings_module(manage_text: str):
+    match = re.search(r"DJANGO_SETTINGS_MODULE[^'\"]*['\"]([^'\"]+)['\"]", manage_text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def resolve_django_project(path: str):
+    base = Path(normalize_path(path))
+
+    if not base.exists():
+        return build_result(False, "❌ Path topilmadi")
+
+    manage_py = find_first_file(base, "manage.py")
+    if not manage_py:
+        return build_result(False, "❌ manage.py topilmadi")
+
+    try:
+        manage_text = manage_py.read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        return build_result(False, f"manage.py o'qib bo'lmadi: {exc}")
+
+    settings_module = parse_settings_module(manage_text)
+    settings_file = None
+    project_dir = manage_py.parent
+
+    if settings_module:
+        settings_candidate = project_dir.joinpath(*settings_module.split(".")).with_suffix(".py")
+        if settings_candidate.exists():
+            settings_file = settings_candidate
+
+    if settings_file is None:
+        settings_file = find_first_file(project_dir, "settings.py")
+        if not settings_file:
+            return build_result(False, "❌ settings.py topilmadi")
+        rel_settings = settings_file.relative_to(project_dir).with_suffix("")
+        settings_module = ".".join(rel_settings.parts)
+
+    project_module = settings_module.rsplit(".", 1)[0] if "." in settings_module else settings_file.parent.name
+    wsgi_module = f"{project_module}.wsgi"
+    wsgi_file = project_dir.joinpath(*wsgi_module.split(".")).with_suffix(".py")
+
+    if not wsgi_file.exists():
+        return build_result(False, "❌ wsgi.py topilmadi")
+
+    env_file = find_first_file(project_dir, ".env")
+
+    return build_result(
+        True,
+        "Django project topildi",
+        project_root=str(project_dir),
+        manage_py=str(manage_py),
+        settings_file=str(settings_file),
+        settings_module=settings_module,
+        project_module=project_module,
+        wsgi_module=wsgi_module,
+        wsgi_file=str(wsgi_file) if wsgi_file.exists() else "",
+        env_file=str(env_file) if env_file else "",
+        python_bin=find_python_bin(project_dir),
+    )
+
+
+def inspect_django_settings(project_root: str, python_bin: str):
+    script = """
+import json
+from django.conf import settings
+
+default_db = settings.DATABASES.get("default", {})
+payload = {
+    "static_root": str(getattr(settings, "STATIC_ROOT", "") or ""),
+    "media_root": str(getattr(settings, "MEDIA_ROOT", "") or ""),
+    "static_url": str(getattr(settings, "STATIC_URL", "") or ""),
+    "media_url": str(getattr(settings, "MEDIA_URL", "") or ""),
+    "allowed_hosts": list(getattr(settings, "ALLOWED_HOSTS", [])),
+    "database_engine": str(default_db.get("ENGINE", "") or ""),
+    "database_name": str(default_db.get("NAME", "") or ""),
+    "database_user": str(default_db.get("USER", "") or ""),
+    "database_host": str(default_db.get("HOST", "") or ""),
+    "database_port": str(default_db.get("PORT", "") or ""),
+}
+print(json.dumps(payload))
+"""
+
+    result = run_command(
+        [python_bin, "manage.py", "shell", "-c", script],
+        cwd=project_root,
+        timeout=180,
+    )
+
+    if not result["success"]:
+        return build_result(
+            False,
+            "Django settings o'qib bo'lmadi",
+            stderr=result["stderr"],
+            stdout=result["stdout"],
+            returncode=result["returncode"],
+        )
+
+    output = result["stdout"].strip().splitlines()
+    if not output:
+        return build_result(False, "Django settings JSON qaytmadi")
+
+    try:
+        settings_data = json.loads(output[-1])
+    except json.JSONDecodeError as exc:
+        return build_result(
+            False,
+            f"Django settings JSON parse bo'lmadi: {exc}",
+            stdout=result["stdout"],
+        )
+
+    return build_result(True, "Django settings aniqlandi", settings=settings_data)
+
+
+def ensure_directory(path: str):
+    if not path:
+        return build_result(True, "skip")
+
+    os.makedirs(path, exist_ok=True)
+    return build_result(True, f"created {path}")
+
+
+def slugify_domain(domain: str):
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", domain.strip().lower())
+    return slug.strip("-")
+
+
+def service_name_for_domain(domain: str):
+    return f"django-{slugify_domain(domain)}"
+
+
+def socket_path_for_domain(domain: str):
+    return f"/run/{service_name_for_domain(domain)}.sock"
+
+
+def service_path_for_domain(domain: str):
+    return f"/etc/systemd/system/{service_name_for_domain(domain)}.service"
+
+
+def site_config_path_for_domain(domain: str):
+    return f"/etc/nginx/sites-available/{domain}"
+
+
+def site_enabled_path_for_domain(domain: str):
+    return f"/etc/nginx/sites-enabled/{domain}"
 
 def check_path(path):
     if not os.path.exists(path):
@@ -420,3 +621,519 @@ def fix_permissions(path: str):
         "success": True,
         "logs": logs
     }
+
+
+def read_template(template_name: str):
+    template_path = Path(__file__).parent / "templates" / template_name
+
+    if not template_path.exists():
+        return None
+
+    return template_path.read_text(encoding="utf-8")
+
+
+def save_text_file(file_path: str, content: str):
+    backup = None
+
+    if os.path.exists(file_path):
+        backup = f"{file_path}.bak"
+        shutil.copy(file_path, backup)
+
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+
+    return {
+        "success": True,
+        "path": file_path,
+        "backup": backup,
+    }
+
+
+def prepare_backend_project(path: str):
+    project = resolve_django_project(path)
+
+    if not project["status"]:
+        return project
+
+    project_root = project["project_root"]
+    python_bin = project["python_bin"]
+
+    if not project.get("env_file"):
+        return build_result(False, "❌ .env topilmadi")
+
+    if not os.path.exists(project["env_file"]):
+        return build_result(False, "❌ .env topilmadi")
+
+    check_result = run_command(
+        [python_bin, "manage.py", "check"],
+        cwd=project_root,
+        timeout=180,
+    )
+
+    if not check_result["success"]:
+        return build_result(
+            False,
+            "❌ Django project check dan o'tmadi",
+            stdout=check_result["stdout"],
+            stderr=check_result["stderr"],
+            returncode=check_result["returncode"],
+        )
+
+    settings_result = inspect_django_settings(project_root, python_bin)
+    if not settings_result["status"]:
+        return settings_result
+
+    settings_data = settings_result["settings"]
+    static_root = settings_data.get("static_root") or ""
+    media_root = settings_data.get("media_root") or ""
+    static_url = settings_data.get("static_url") or ""
+    media_url = settings_data.get("media_url") or ""
+    database_engine = (settings_data.get("database_engine") or "").lower()
+    database_name = settings_data.get("database_name") or ""
+
+    if not static_root:
+        return build_result(False, "❌ settings.py da STATIC_ROOT topilmadi")
+
+    if not media_root:
+        return build_result(False, "❌ settings.py da MEDIA_ROOT topilmadi")
+
+    if not static_url:
+        return build_result(False, "❌ settings.py da STATIC_URL topilmadi")
+
+    if not media_url:
+        return build_result(False, "❌ settings.py da MEDIA_URL topilmadi")
+
+    if not database_engine:
+        return build_result(False, "❌ settings.py da database engine topilmadi")
+
+    checks = [
+        f"manage.py: {project['manage_py']}",
+        f"settings.py: {project['settings_file']}",
+        f".env: {project['env_file']}",
+        f"STATIC_ROOT: {static_root}",
+        f"MEDIA_ROOT: {media_root}",
+        f"STATIC_URL: {static_url}",
+        f"MEDIA_URL: {media_url}",
+        f"Database engine: {database_engine}",
+        f"WSGI/ASGI: {project['wsgi_module']}",
+    ]
+
+    sqlite_path = ""
+    if "sqlite" in database_engine:
+        sqlite_path = database_name
+        if sqlite_path and not os.path.isabs(sqlite_path):
+            sqlite_path = str((Path(project_root) / sqlite_path).resolve())
+
+        if sqlite_path and os.path.exists(sqlite_path):
+            checks.append(f"SQLite database: {sqlite_path}")
+        else:
+            checks.append("SQLite database hozircha yo'q, migrate uni yaratadi")
+    else:
+        checks.append("PostgreSQL yoki boshqa external database topildi")
+
+    return build_result(
+        True,
+        "Django REST API tayyor",
+        project=project,
+        settings=settings_data,
+        checks=checks,
+        sqlite_path=sqlite_path,
+    )
+
+
+def check_backend_path(path: str):
+    result = prepare_backend_project(path)
+
+    if not result["status"]:
+        return result
+
+    return build_result(
+        True,
+        "✅ Django REST API aniqlandi",
+        checks=result.get("checks", []),
+        project=result.get("project", {}),
+        settings=result.get("settings", {}),
+    )
+
+
+def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path: str):
+    template = read_template("backend.conf")
+
+    if template is None:
+        return build_result(False, "backend.conf topilmadi")
+
+    static_root = settings_data.get("static_root") or ""
+    media_root = settings_data.get("media_root") or ""
+    static_url = settings_data.get("static_url") or "/static/"
+    media_url = settings_data.get("media_url") or "/media/"
+    upstream_name = service_name_for_domain(domain)
+
+    config = template.replace("{{DOMAIN}}", domain)
+    config = config.replace("{{STATIC_ROOT}}", static_root)
+    config = config.replace("{{MEDIA_ROOT}}", media_root)
+    config = config.replace("{{STATIC_URL}}", static_url)
+    config = config.replace("{{MEDIA_URL}}", media_url)
+    config = config.replace("{{UPSTREAM_NAME}}", upstream_name)
+    config = config.replace("{{SOCKET_PATH}}", socket_path)
+
+    return build_result(True, "Nginx config tayyor", config=config)
+
+
+def generate_backend_service_config(domain: str, project: dict, socket_path: str):
+    template = read_template("backend.service")
+
+    if template is None:
+        return build_result(False, "backend.service topilmadi")
+
+    env_file = project.get("env_file") or ""
+    python_bin = project.get("python_bin") or shutil.which("python3") or "python3"
+    wsgi_module = project.get("wsgi_module") or ""
+    project_root = project.get("project_root") or ""
+    service_name = service_name_for_domain(domain)
+
+    config = template.replace("{{DOMAIN}}", domain)
+    config = config.replace("{{SERVICE_NAME}}", service_name)
+    config = config.replace("{{PROJECT_ROOT}}", project_root)
+    config = config.replace("{{PYTHON_BIN}}", python_bin)
+    config = config.replace("{{WSGI_MODULE}}", wsgi_module)
+    config = config.replace("{{SOCKET_PATH}}", socket_path)
+    config = config.replace("{{ENV_FILE}}", env_file)
+
+    return build_result(True, "Systemd service tayyor", config=config)
+
+
+def save_backend_service(service_name: str, config: str):
+    service_path = f"/etc/systemd/system/{service_name}.service"
+    return save_text_file(service_path, config)
+
+
+def systemd_daemon_reload():
+    result = run_command(["systemctl", "daemon-reload"])
+
+    if not result["success"]:
+        return build_result(False, result["stderr"], stdout=result["stdout"])
+
+    return build_result(True, "systemd qayta yuklandi")
+
+
+def enable_and_start_service(service_name: str):
+    result = run_command(["systemctl", "enable", "--now", service_name], timeout=180)
+
+    if not result["success"]:
+        return build_result(
+            False,
+            f"Service ishga tushmadi: {service_name}",
+            stdout=result["stdout"],
+            stderr=result["stderr"],
+            returncode=result["returncode"],
+        )
+
+    return build_result(True, f"Service ishga tushdi: {service_name}")
+
+
+def service_is_active(service_name: str):
+    result = run_command(["systemctl", "is-active", service_name], timeout=30)
+    return result["success"]
+
+
+def service_status(service_name: str):
+    return run_command(["systemctl", "status", service_name, "--no-pager", "-l"], timeout=60)
+
+
+def run_manage_command(project_root: str, python_bin: str, args: list):
+    return run_command([python_bin, "manage.py", *args], cwd=project_root, timeout=1800)
+
+
+def collect_static(project_root: str, python_bin: str):
+    return run_manage_command(project_root, python_bin, ["collectstatic", "--noinput"])
+
+
+def migrate_database(project_root: str, python_bin: str):
+    return run_manage_command(project_root, python_bin, ["migrate", "--noinput"])
+
+
+def diagnose_backend_permissions(path: str, static_root: str, media_root: str):
+    checks = [
+        path,
+        static_root,
+        media_root,
+    ]
+
+    for item in checks:
+        if not item:
+            continue
+
+        result = run_command(
+            ["sudo", "-u", "www-data", "ls", item],
+            timeout=30,
+        )
+
+        if not result["success"]:
+            return build_result(
+                False,
+                f"www-data '{item}' pathini o'qiy olmayapti",
+                stderr=result["stderr"],
+                stdout=result["stdout"],
+            )
+
+    return build_result(True, "www-data pathlarni o'qiy oladi")
+
+
+def fix_backend_permissions(path: str, static_root: str, media_root: str):
+    commands = [
+        ["chown", "-R", "www-data:www-data", path],
+    ]
+
+    for extra_path in [static_root, media_root]:
+        if extra_path and extra_path != path:
+            commands.append(["chown", "-R", "www-data:www-data", extra_path])
+
+    commands.extend(
+        [
+            ["find", path, "-type", "d", "-exec", "chmod", "755", "{}", ";"],
+            ["find", path, "-type", "f", "-name", "*.py", "-exec", "chmod", "644", "{}", ";"],
+            ["find", path, "-type", "f", "-name", "*.sqlite3", "-exec", "chmod", "664", "{}", ";"],
+            ["find", path, "-type", "f", "-name", ".env", "-exec", "chmod", "640", "{}", ";"],
+        ]
+    )
+
+    for extra_path in [static_root, media_root]:
+        if extra_path:
+            commands.extend(
+                [
+                    ["find", extra_path, "-type", "d", "-exec", "chmod", "755", "{}", ";"],
+                    ["find", extra_path, "-type", "f", "-exec", "chmod", "644", "{}", ";"],
+                ]
+            )
+
+    logs = []
+
+    for command in commands:
+        result = run_command(command)
+        if not result["success"]:
+            return build_result(False, result["stderr"], logs=logs)
+
+        logs.append(" ".join(command))
+
+    return build_result(True, "Permissions fix qilindi", logs=logs)
+
+
+def check_site_status(domain: str):
+    try:
+        response = requests.get(
+            f"http://{domain}",
+            timeout=20,
+            allow_redirects=True,
+        )
+
+        return {
+            "success": response.status_code in [200, 301, 302, 304],
+            "status_code": response.status_code,
+            "text": response.text[:1000],
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "msg": str(exc),
+        }
+
+
+def deploy_backend(path: str, domain: str):
+    logs = []
+    domain = (domain or "").strip()
+
+    if not domain:
+        return build_result(False, "Domain kiritilmadi")
+
+    prepared = prepare_backend_project(path)
+    if not prepared["status"]:
+        return prepared
+
+    project = prepared["project"]
+    settings_data = prepared["settings"]
+    project_root = project["project_root"]
+    python_bin = project["python_bin"]
+    static_root = settings_data["static_root"]
+    media_root = settings_data["media_root"]
+    service_name = service_name_for_domain(domain)
+    socket_path = socket_path_for_domain(domain)
+    site_config_path = site_config_path_for_domain(domain)
+    site_enabled_path = site_enabled_path_for_domain(domain)
+    service_file_path = service_path_for_domain(domain)
+
+    if service_is_active(service_name) and os.path.islink(site_enabled_path):
+        return build_result(
+            True,
+            f"Bu domain uchun service allaqachon ishlayapti: {domain}",
+            already_running=True,
+            service_name=service_name,
+            url=f"http://{domain}",
+        )
+
+    ensure_directory(static_root)
+    ensure_directory(media_root)
+
+    logs.append("✅ Django project tekshiruvdan o'tdi")
+
+    permission_check = diagnose_backend_permissions(project_root, static_root, media_root)
+    if not permission_check["status"]:
+        logs.append("⚠️ Permission muammosi aniqlandi, tuzatilmoqda")
+        fix_result = fix_backend_permissions(project_root, static_root, media_root)
+        if not fix_result["status"]:
+            return build_result(False, fix_result["msg"], logs=logs + fix_result.get("logs", []))
+
+        logs.extend(fix_result.get("logs", []))
+        logs.append("✅ Permissionlar tuzatildi")
+
+    migrate_result = migrate_database(project_root, python_bin)
+    if not migrate_result["success"]:
+        return build_result(
+            False,
+            "❌ migrate bajarilmadi",
+            logs=logs,
+            stdout=migrate_result["stdout"],
+            stderr=migrate_result["stderr"],
+            returncode=migrate_result["returncode"],
+        )
+
+    logs.append("✅ migrate bajarildi")
+
+    collect_result = collect_static(project_root, python_bin)
+    if not collect_result["success"]:
+        return build_result(
+            False,
+            "❌ collectstatic bajarilmadi",
+            logs=logs,
+            stdout=collect_result["stdout"],
+            stderr=collect_result["stderr"],
+            returncode=collect_result["returncode"],
+        )
+
+    logs.append("✅ collectstatic bajarildi")
+
+    nginx_result = generate_backend_nginx_config(domain, settings_data, socket_path)
+    if not nginx_result["success"]:
+        return build_result(False, nginx_result["msg"], logs=logs)
+
+    service_result = generate_backend_service_config(domain, project, socket_path)
+    if not service_result["success"]:
+        return build_result(False, service_result["msg"], logs=logs)
+
+    config_result = save_text_file(site_config_path, nginx_result["config"])
+    if not config_result["success"]:
+        return build_result(False, "Nginx config saqlanmadi", logs=logs)
+
+    logs.append("✅ Nginx konfiguratsiyasi saqlandi")
+
+    service_save_result = save_backend_service(service_name, service_result["config"])
+    if not service_save_result["success"]:
+        return build_result(False, "Systemd service saqlanmadi", logs=logs)
+
+    logs.append("✅ Systemd service saqlandi")
+
+    enable_result = enable_site(domain)
+    if not enable_result["success"]:
+        rollback(
+            config_path=site_config_path,
+            enabled_path=site_enabled_path,
+            backup=config_result["backup"],
+        )
+        return build_result(False, enable_result.get("msg", "Nginx site enable bo'lmadi"), logs=logs)
+
+    logs.append("✅ Nginx site yoqildi")
+
+    daemon_result = systemd_daemon_reload()
+    if not daemon_result["success"]:
+        return build_result(False, daemon_result["msg"], logs=logs)
+
+    logs.append("✅ systemd daemon-reload bajarildi")
+
+    start_result = enable_and_start_service(service_name)
+    if not start_result["success"]:
+        status_result = service_status(service_name)
+        rollback(
+            config_path=site_config_path,
+            enabled_path=site_enabled_path,
+            backup=config_result["backup"],
+        )
+        return build_result(
+            False,
+            start_result["msg"],
+            logs=logs,
+            stdout=status_result["stdout"],
+            stderr=status_result["stderr"],
+        )
+
+    logs.append("✅ Service ishga tushdi")
+
+    nginx_test = test_nginx()
+    if not nginx_test["success"]:
+        rollback(
+            config_path=site_config_path,
+            enabled_path=site_enabled_path,
+            backup=config_result["backup"],
+        )
+        return build_result(False, nginx_test["msg"], logs=logs)
+
+    logs.append("✅ Nginx konfiguratsiyasi tekshirildi")
+
+    reload_result = reload_nginx()
+    if not reload_result["success"]:
+        rollback(
+            config_path=site_config_path,
+            enabled_path=site_enabled_path,
+            backup=config_result["backup"],
+        )
+        return build_result(False, reload_result["msg"], logs=logs)
+
+    logs.append("✅ Nginx qayta yuklandi")
+
+    site_result = check_site_status(domain)
+    if site_result.get("success"):
+        logs.append("✅ Django backend muvaffaqiyatli ishga tushdi")
+        return build_result(
+            True,
+            "Django backend deploy yakunlandi",
+            logs=logs,
+            url=f"http://{domain}",
+            service_name=service_name,
+            site_config=site_config_path,
+            service_file=service_file_path,
+        )
+
+    logs.append(f"⚠️ Sayt javobi muammo berdi: {site_result.get('status_code') or site_result.get('msg')}")
+
+    permission_check = diagnose_backend_permissions(project_root, static_root, media_root)
+    if not permission_check["status"]:
+        logs.append("🔍 Permission muammosi topildi, qayta tuzatilmoqda")
+        fix_result = fix_backend_permissions(project_root, static_root, media_root)
+        if fix_result["status"]:
+            logs.extend(fix_result.get("logs", []))
+            restart_result = run_command(["systemctl", "restart", service_name], timeout=180)
+            if restart_result["success"]:
+                logs.append("✅ Service qayta ishga tushdi")
+                reload_nginx()
+                site_result = check_site_status(domain)
+                if site_result.get("success"):
+                    logs.append("✅ Sayt qayta tekshiruvdan o'tdi")
+                    return build_result(
+                        True,
+                        "Django backend deploy yakunlandi",
+                        logs=logs,
+                        url=f"http://{domain}",
+                        service_name=service_name,
+                    )
+
+        else:
+            logs.append(f"⚠️ Permission fix muvaffaqiyatsiz: {fix_result['msg']}")
+
+    return build_result(
+        False,
+        "Backend sayti ishga tushmadi",
+        logs=logs,
+        status_code=site_result.get("status_code"),
+        site_error=site_result.get("msg") or site_result.get("text"),
+        service_name=service_name,
+    )
