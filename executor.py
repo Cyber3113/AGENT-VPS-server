@@ -325,6 +325,66 @@ print(json.dumps(payload))
     return build_result(True, "Django settings aniqlandi", settings=settings_data)
 
 
+# settings.py oxiriga qo'shiladigan blok boshidagi belgi (takror qo'shmaslik uchun)
+STATIC_MEDIA_MARKER = "# === Deploy robot tomonidan avtomatik qo'shildi ==="
+
+
+def ensure_static_media_settings(project: dict, settings_data: dict):
+    """
+    settings.py da STATIC_ROOT / MEDIA_ROOT / STATIC_URL / MEDIA_URL bo'lmasa,
+    ularni faylning oxiriga avtomatik qo'shadi. BASE_DIR bo'lsa undan, bo'lmasa
+    project_root dan foydalanadi. Qaysi sozlamalar qo'shilganini qaytaradi.
+    """
+    settings_file = project.get("settings_file")
+    if not settings_file or not os.path.exists(settings_file):
+        return build_result(False, "settings.py topilmadi")
+
+    try:
+        text = Path(settings_file).read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        return build_result(False, f"settings.py o'qib bo'lmadi: {exc}")
+
+    if STATIC_MEDIA_MARKER in text:
+        return build_result(True, "settings.py allaqachon to'ldirilgan", added=[])
+
+    missing = {
+        "STATIC_URL": not (settings_data.get("static_url") or ""),
+        "STATIC_ROOT": not (settings_data.get("static_root") or ""),
+        "MEDIA_URL": not (settings_data.get("media_url") or ""),
+        "MEDIA_ROOT": not (settings_data.get("media_root") or ""),
+    }
+
+    if not any(missing.values()):
+        return build_result(True, "STATIC/MEDIA sozlamalari mavjud", added=[])
+
+    project_root = project.get("project_root") or "."
+
+    lines = ["", STATIC_MEDIA_MARKER, "import os as _dr_os", "", "try:", "    _DR_BASE_DIR = str(BASE_DIR)", "except NameError:", f"    _DR_BASE_DIR = {project_root!r}", ""]
+
+    added = []
+    if missing["STATIC_URL"]:
+        lines.append('STATIC_URL = "/static/"')
+        added.append("STATIC_URL")
+    if missing["STATIC_ROOT"]:
+        lines.append('STATIC_ROOT = _dr_os.path.join(_DR_BASE_DIR, "staticfiles")')
+        added.append("STATIC_ROOT")
+    if missing["MEDIA_URL"]:
+        lines.append('MEDIA_URL = "/media/"')
+        added.append("MEDIA_URL")
+    if missing["MEDIA_ROOT"]:
+        lines.append('MEDIA_ROOT = _dr_os.path.join(_DR_BASE_DIR, "media")')
+        added.append("MEDIA_ROOT")
+
+    lines.append("")
+    new_text = text.rstrip() + "\n" + "\n".join(lines)
+
+    saved = save_text_file(settings_file, new_text)
+    if not saved["success"]:
+        return build_result(False, "settings.py yozib bo'lmadi")
+
+    return build_result(True, "STATIC/MEDIA sozlamalari qo'shildi", added=added)
+
+
 def ensure_directory(path: str):
     if not path:
         return build_result(True, "skip")
@@ -859,24 +919,40 @@ def prepare_backend_project(path: str):
     database_engine = (settings_data.get("database_engine") or "").lower()
     database_name = settings_data.get("database_name") or ""
 
-    # Websocket / ASGI aniqlash: settings dagi ASGI_APPLICATION yoki channels/daphne
-    # bo'lsa hamda asgi.py fayli mavjud bo'lsa, ASGI rejimida deploy qilamiz.
-    is_asgi = bool(settings_data.get("is_asgi")) and bool(project.get("asgi_file"))
+    # STATIC_ROOT / MEDIA_ROOT / STATIC_URL / MEDIA_URL bo'lmasa — settings.py ga
+    # avtomatik qo'shamiz va sozlamalarni qayta o'qiymiz.
+    if not (static_root and media_root and static_url and media_url):
+        fix = ensure_static_media_settings(project, settings_data)
+        if fix["status"] and fix.get("added"):
+            venv_logs = venv_logs + [
+                f"✅ settings.py ga avtomatik qo'shildi: {', '.join(fix['added'])}"
+            ]
+            settings_result = inspect_django_settings(project_root, python_bin)
+            if settings_result["status"]:
+                settings_data = settings_result["settings"]
+                static_root = settings_data.get("static_root") or ""
+                media_root = settings_data.get("media_root") or ""
+                static_url = settings_data.get("static_url") or ""
+                media_url = settings_data.get("media_url") or ""
 
     if not static_root:
-        return build_result(False, "❌ settings.py da STATIC_ROOT topilmadi")
+        return build_result(False, "❌ settings.py da STATIC_ROOT topilmadi va qo'shib bo'lmadi")
 
     if not media_root:
-        return build_result(False, "❌ settings.py da MEDIA_ROOT topilmadi")
+        return build_result(False, "❌ settings.py da MEDIA_ROOT topilmadi va qo'shib bo'lmadi")
 
     if not static_url:
-        return build_result(False, "❌ settings.py da STATIC_URL topilmadi")
+        return build_result(False, "❌ settings.py da STATIC_URL topilmadi va qo'shib bo'lmadi")
 
     if not media_url:
-        return build_result(False, "❌ settings.py da MEDIA_URL topilmadi")
+        return build_result(False, "❌ settings.py da MEDIA_URL topilmadi va qo'shib bo'lmadi")
 
     if not database_engine:
         return build_result(False, "❌ settings.py da database engine topilmadi")
+
+    # Websocket / ASGI aniqlash: settings dagi ASGI_APPLICATION yoki channels/daphne
+    # bo'lsa hamda asgi.py fayli mavjud bo'lsa, ASGI rejimida deploy qilamiz.
+    is_asgi = bool(settings_data.get("is_asgi")) and bool(project.get("asgi_file"))
 
     checks = [
         f"manage.py: {project['manage_py']}",
