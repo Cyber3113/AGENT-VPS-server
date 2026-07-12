@@ -62,6 +62,35 @@ def find_first_file(base: Path, filename: str):
     return candidates[0]
 
 
+def detect_run_user(path: str):
+    """
+    Loyiha egasini aniqlaydi — service shu user sifatida ishga tushiriladi.
+    /home/<user>/... ko'rinishidagi papka egasini oladi (masalan foodly), aks
+    holda pathning haqiqiy egasini (www-data bo'lmasa) yoki www-data ni qaytaradi.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return "www-data"
+
+    home = Path("/home")
+    for parent in [resolved, *resolved.parents]:
+        if parent.parent == home and parent.name:
+            try:
+                return pwd.getpwuid(parent.stat().st_uid).pw_name
+            except Exception:
+                return parent.name
+
+    try:
+        owner = pwd.getpwuid(resolved.stat().st_uid).pw_name
+        if owner and owner != "www-data":
+            return owner
+    except Exception:
+        pass
+
+    return "www-data"
+
+
 def find_python_bin(project_root: Path):
     candidates = [
         project_root / ".venv" / "bin" / "python",
@@ -170,9 +199,11 @@ def ensure_virtualenv(base: Path):
     else:
         logs.append("⚠️ requirements.txt topilmadi, faqat server paketlari o'rnatiladi")
 
-    # WSGI (gunicorn) va ASGI/websocket (uvicorn) uchun server paketlari
+    # WSGI (gunicorn) va ASGI/websocket (uvicorn) uchun server paketlari.
+    # uvicorn-worker — gunicorn uchun UvicornWorker klassi (eski uvicorn.workers
+    # o'rnini bosgan alohida paket, yangi uvicorn versiyalarida shu ishlatiladi).
     server = run_command(
-        [python_bin_str, "-m", "pip", "install", "gunicorn", "uvicorn[standard]"],
+        [python_bin_str, "-m", "pip", "install", "gunicorn", "uvicorn[standard]", "uvicorn-worker"],
         timeout=900,
     )
     if not server["success"]:
@@ -183,7 +214,7 @@ def ensure_virtualenv(base: Path):
             stderr=server["stderr"],
             stdout=server["stdout"],
         )
-    logs.append("✅ gunicorn va uvicorn o'rnatildi")
+    logs.append("✅ gunicorn, uvicorn va uvicorn-worker o'rnatildi")
 
     return build_result(
         True,
@@ -889,6 +920,7 @@ def prepare_backend_project(path: str):
     project["python_bin"] = python_bin
     project["gunicorn_bin"] = venv_result["gunicorn_bin"]
     project["venv_dir"] = venv_result["venv_dir"]
+    project["run_user"] = detect_run_user(str(base_root))
     venv_logs = venv_result.get("logs", [])
     if project.get("env_created"):
         venv_logs = venv_logs + [f"✅ .env fayli .env.example dan yaratildi: {project['env_file']}"]
@@ -1094,7 +1126,7 @@ def build_exec_start(project: dict, socket_path: str, is_asgi: bool):
         module = project["asgi_module"]
         return (
             f"{gunicorn_bin} --chdir {project_root} "
-            f"--workers 3 --worker-class uvicorn.workers.UvicornWorker "
+            f"--workers 3 --worker-class uvicorn_worker.UvicornWorker "
             f"--bind unix:{socket_path} {module}:application"
         )
 
@@ -1113,6 +1145,7 @@ def generate_backend_service_config(domain: str, project: dict, socket_path: str
 
     env_file = project.get("env_file") or ""
     project_root = project.get("project_root") or ""
+    run_user = project.get("run_user") or "www-data"
     service_name = service_name_for_domain(domain)
     env_file_line = f"EnvironmentFile={env_file}" if env_file else ""
     exec_start = build_exec_start(project, socket_path, is_asgi)
@@ -1120,6 +1153,7 @@ def generate_backend_service_config(domain: str, project: dict, socket_path: str
     config = template.replace("{{DOMAIN}}", domain)
     config = config.replace("{{SERVICE_NAME}}", service_name)
     config = config.replace("{{PROJECT_ROOT}}", project_root)
+    config = config.replace("{{RUN_USER}}", run_user)
     config = config.replace("{{ENV_FILE_LINE}}", env_file_line)
     config = config.replace("{{EXEC_START}}", exec_start)
     config = config.replace("{{SOCKET_PATH}}", socket_path)
@@ -1163,6 +1197,14 @@ def service_is_active(service_name: str):
 
 def service_status(service_name: str):
     return run_command(["systemctl", "status", service_name, "--no-pager", "-l"], timeout=60)
+
+
+def service_logs(service_name: str, lines: int = 40):
+    """Service jurnalini (journalctl) oladi — nosozlik sababini ko'rsatish uchun."""
+    return run_command(
+        ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
+        timeout=60,
+    )
 
 
 def run_manage_command(project_root: str, python_bin: str, args: list):
@@ -1231,16 +1273,19 @@ def traverse_commands(*paths):
     return commands
 
 
-def fix_backend_permissions(path: str, static_root: str, media_root: str):
-    # Avval loyiha va static/media yo'llariga www-data traverse qila olishini
-    # ta'minlaymiz (ota-papkalarga o+x)
+def fix_backend_permissions(path: str, static_root: str, media_root: str, run_user: str = "www-data", venv_dir: str = ""):
+    # Egasi: loyiha user (masalan foodly), guruhi: www-data (nginx uchun)
+    owner = f"{run_user}:www-data"
+
+    # Avval loyiha va static/media yo'llariga nginx (www-data) traverse qila
+    # olishini ta'minlaymiz (ota-papkalarga o+x)
     commands = traverse_commands(path, static_root, media_root)
 
-    commands.append(["chown", "-R", "www-data:www-data", path])
+    commands.append(["chown", "-R", owner, path])
 
-    for extra_path in [static_root, media_root]:
+    for extra_path in [static_root, media_root, venv_dir]:
         if extra_path and extra_path != path:
-            commands.append(["chown", "-R", "www-data:www-data", extra_path])
+            commands.append(["chown", "-R", owner, extra_path])
 
     commands.extend(
         [
@@ -1389,6 +1434,8 @@ def deploy_backend(path: str, domain: str):
     is_asgi = prepared.get("is_asgi", False)
     project_root = project["project_root"]
     python_bin = project["python_bin"]
+    run_user = project.get("run_user") or "www-data"
+    venv_dir = project.get("venv_dir") or ""
     static_root = settings_data["static_root"]
     media_root = settings_data["media_root"]
     service_name = service_name_for_domain(domain)
@@ -1440,10 +1487,10 @@ def deploy_backend(path: str, domain: str):
     logs.append("✅ collectstatic bajarildi")
 
     # migrate/collectstatic root sifatida ishlaydi, shuning uchun kod, venv,
-    # static/media va DB fayllarini www-data egaligiga o'tkazamiz
-    fix_result = fix_backend_permissions(project_root, static_root, media_root)
+    # static/media va DB fayllarini {run_user}:www-data egaligiga o'tkazamiz
+    fix_result = fix_backend_permissions(project_root, static_root, media_root, run_user, venv_dir)
     if fix_result["status"]:
-        logs.append("✅ Fayl huquqlari www-data uchun sozlandi")
+        logs.append(f"✅ Fayl huquqlari sozlandi (egasi: {run_user}, guruh: www-data)")
     else:
         logs.append(f"⚠️ Permission sozlashda muammo: {fix_result['msg']}")
 
@@ -1544,7 +1591,7 @@ def deploy_backend(path: str, domain: str):
     permission_check = diagnose_backend_permissions(project_root, static_root, media_root)
     if not permission_check["status"]:
         logs.append("🔍 Permission muammosi topildi, qayta tuzatilmoqda")
-        fix_result = fix_backend_permissions(project_root, static_root, media_root)
+        fix_result = fix_backend_permissions(project_root, static_root, media_root, run_user, venv_dir)
         if fix_result["status"]:
             logs.extend(fix_result.get("logs", []))
             restart_result = run_command(["systemctl", "restart", service_name], timeout=180)
@@ -1563,6 +1610,9 @@ def deploy_backend(path: str, domain: str):
         else:
             logs.append(f"⚠️ Permission fix muvaffaqiyatsiz: {fix_result['msg']}")
 
+    # Sayt hali ham ishlamadi — asl sababni ko'rsatish uchun service jurnalini olamiz
+    journal = service_logs(service_name, lines=50)
+
     return build_result(
         False,
         "Backend sayti ishga tushmadi",
@@ -1570,4 +1620,6 @@ def deploy_backend(path: str, domain: str):
         status_code=site_result.get("status_code"),
         site_error=site_result.get("msg") or site_result.get("text"),
         service_name=service_name,
+        stdout=journal.get("stdout", ""),
+        stderr=journal.get("stderr", ""),
     )

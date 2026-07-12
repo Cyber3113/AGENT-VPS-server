@@ -3,8 +3,9 @@ Description=Django backend ({{SERVICE_NAME}}) for {{DOMAIN}}
 After=network.target
 
 [Service]
-User=www-data
+User={{RUN_USER}}
 Group=www-data
+UMask=0007
 RuntimeDirectory={{SERVICE_NAME}}
 WorkingDirectory={{PROJECT_ROOT}}
 {{ENV_FILE_LINE}}
