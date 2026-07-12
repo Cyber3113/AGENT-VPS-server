@@ -11,6 +11,20 @@ import requests
 from utils import run_command
 
 
+# Let's Encrypt uchun email (bo'sh bo'lsa emailsiz ro'yxatdan o'tadi)
+LETSENCRYPT_EMAIL = os.environ.get("LETSENCRYPT_EMAIL", "").strip()
+
+# .env fayl namunasi sifatida qabul qilinadigan fayl nomlari
+ENV_EXAMPLE_NAMES = (
+    ".env.example",
+    ".env.sample",
+    ".env.dist",
+    ".env.template",
+    "env.example",
+    "env.sample",
+)
+
+
 def build_result(success: bool, msg: str, **extra):
     payload = {
         "status": success,
@@ -61,6 +75,126 @@ def find_python_bin(project_root: Path):
     return shutil.which("python3") or shutil.which("python") or "python3"
 
 
+def find_env_example(base: Path):
+    for name in ENV_EXAMPLE_NAMES:
+        found = find_first_file(base, name)
+        if found:
+            return found
+    return None
+
+
+def ensure_env_file(base: Path):
+    """
+    .env faylini topadi. Agar .env bo'lmasa, lekin .env.example (yoki shunga
+    o'xshash namuna) mavjud bo'lsa, uni avtomatik .env ga nusxalaydi.
+    """
+    env_file = find_first_file(base, ".env")
+    if env_file and env_file.exists():
+        return env_file, False
+
+    example = find_env_example(base)
+    if example and example.exists():
+        target = example.parent / ".env"
+        if not target.exists():
+            shutil.copy(example, target)
+        return target, True
+
+    return None, False
+
+
+def find_requirements_file(base: Path):
+    return find_first_file(base, "requirements.txt")
+
+
+def find_existing_venv(venv_parent: Path):
+    for name in (".venv", "venv", "env"):
+        candidate = venv_parent / name / "bin" / "python"
+        if candidate.exists():
+            return candidate.parent.parent
+    return None
+
+
+def ensure_virtualenv(base: Path):
+    """
+    requirements.txt joylashgan papkada virtual muhit yaratadi (yoki mavjudini
+    ishlatadi), kutubxonalarni o'rnatadi va gunicorn/uvicorn ni qo'shadi.
+    Django deploy uchun kerakli python_bin va gunicorn_bin ni qaytaradi.
+    """
+    logs = []
+
+    requirements = find_requirements_file(base)
+    venv_parent = requirements.parent if requirements else base
+
+    venv_dir = find_existing_venv(venv_parent) or find_existing_venv(base)
+    if venv_dir is None:
+        venv_dir = venv_parent / "venv"
+
+    python_bin = venv_dir / "bin" / "python"
+
+    if not python_bin.exists():
+        create = run_command(["python3", "-m", "venv", str(venv_dir)], timeout=300)
+        if not create["success"]:
+            return build_result(
+                False,
+                "❌ Virtual muhit yaratilmadi",
+                stderr=create["stderr"],
+                stdout=create["stdout"],
+            )
+        logs.append(f"✅ Virtual muhit yaratildi: {venv_dir}")
+    else:
+        logs.append(f"✅ Mavjud virtual muhit topildi: {venv_dir}")
+
+    python_bin_str = str(python_bin)
+
+    # pip/setuptools/wheel ni yangilash (xatolik bo'lsa ham to'xtamaymiz)
+    run_command(
+        [python_bin_str, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+        timeout=600,
+    )
+
+    if requirements:
+        install = run_command(
+            [python_bin_str, "-m", "pip", "install", "-r", str(requirements)],
+            timeout=1800,
+        )
+        if not install["success"]:
+            return build_result(
+                False,
+                "❌ requirements.txt o'rnatilmadi",
+                logs=logs,
+                stderr=install["stderr"],
+                stdout=install["stdout"],
+            )
+        logs.append(f"✅ Kutubxonalar o'rnatildi: {requirements}")
+    else:
+        logs.append("⚠️ requirements.txt topilmadi, faqat server paketlari o'rnatiladi")
+
+    # WSGI (gunicorn) va ASGI/websocket (uvicorn) uchun server paketlari
+    server = run_command(
+        [python_bin_str, "-m", "pip", "install", "gunicorn", "uvicorn[standard]"],
+        timeout=900,
+    )
+    if not server["success"]:
+        return build_result(
+            False,
+            "❌ gunicorn/uvicorn o'rnatilmadi",
+            logs=logs,
+            stderr=server["stderr"],
+            stdout=server["stdout"],
+        )
+    logs.append("✅ gunicorn va uvicorn o'rnatildi")
+
+    return build_result(
+        True,
+        "Virtual muhit tayyor",
+        venv_dir=str(venv_dir),
+        python_bin=python_bin_str,
+        gunicorn_bin=str(venv_dir / "bin" / "gunicorn"),
+        requirements=str(requirements) if requirements else "",
+        logs=logs,
+    )
+
+
 def parse_settings_module(manage_text: str):
     match = re.search(r"DJANGO_SETTINGS_MODULE[^'\"]*['\"]([^'\"]+)['\"]", manage_text)
     if match:
@@ -103,14 +237,19 @@ def resolve_django_project(path: str):
     wsgi_module = f"{project_module}.wsgi"
     wsgi_file = project_dir.joinpath(*wsgi_module.split(".")).with_suffix(".py")
 
-    if not wsgi_file.exists():
-        return build_result(False, "❌ wsgi.py topilmadi")
+    asgi_module = f"{project_module}.asgi"
+    asgi_file = project_dir.joinpath(*asgi_module.split(".")).with_suffix(".py")
 
-    env_file = find_first_file(project_dir, ".env")
+    if not wsgi_file.exists() and not asgi_file.exists():
+        return build_result(False, "❌ wsgi.py yoki asgi.py topilmadi")
+
+    # .env ni loyiha ildizidan (base) qidiramiz, kerak bo'lsa .env.example dan yaratamiz
+    env_file, env_created = ensure_env_file(base)
 
     return build_result(
         True,
         "Django project topildi",
+        base_root=str(base),
         project_root=str(project_dir),
         manage_py=str(manage_py),
         settings_file=str(settings_file),
@@ -118,7 +257,10 @@ def resolve_django_project(path: str):
         project_module=project_module,
         wsgi_module=wsgi_module,
         wsgi_file=str(wsgi_file) if wsgi_file.exists() else "",
+        asgi_module=asgi_module,
+        asgi_file=str(asgi_file) if asgi_file.exists() else "",
         env_file=str(env_file) if env_file else "",
+        env_created=env_created,
         python_bin=find_python_bin(project_dir),
     )
 
@@ -129,6 +271,10 @@ import json
 from django.conf import settings
 
 default_db = settings.DATABASES.get("default", {})
+installed_apps = [str(app) for app in getattr(settings, "INSTALLED_APPS", [])]
+asgi_application = str(getattr(settings, "ASGI_APPLICATION", "") or "")
+channels_layers = bool(getattr(settings, "CHANNEL_LAYERS", None))
+has_channels = any(app.split(".")[0] in ("channels", "daphne") for app in installed_apps)
 payload = {
     "static_root": str(getattr(settings, "STATIC_ROOT", "") or ""),
     "media_root": str(getattr(settings, "MEDIA_ROOT", "") or ""),
@@ -140,6 +286,10 @@ payload = {
     "database_user": str(default_db.get("USER", "") or ""),
     "database_host": str(default_db.get("HOST", "") or ""),
     "database_port": str(default_db.get("PORT", "") or ""),
+    "asgi_application": asgi_application,
+    "has_channels": has_channels,
+    "channel_layers": channels_layers,
+    "is_asgi": bool(asgi_application) or has_channels,
 }
 print(json.dumps(payload))
 """
@@ -193,7 +343,9 @@ def service_name_for_domain(domain: str):
 
 
 def socket_path_for_domain(domain: str):
-    return f"/run/{service_name_for_domain(domain)}.sock"
+    # RuntimeDirectory=<service> systemd tomonidan /run/<service> ni www-data
+    # egaligida yaratadi, shuning uchun socket shu papka ichida bo'ladi
+    return f"/run/{service_name_for_domain(domain)}/backend.sock"
 
 
 def service_path_for_domain(domain: str):
@@ -658,13 +810,27 @@ def prepare_backend_project(path: str):
         return project
 
     project_root = project["project_root"]
-    python_bin = project["python_bin"]
+    base_root = Path(project.get("base_root") or project_root)
 
     if not project.get("env_file"):
-        return build_result(False, "❌ .env topilmadi")
+        return build_result(False, "❌ .env (yoki .env.example) topilmadi")
 
     if not os.path.exists(project["env_file"]):
         return build_result(False, "❌ .env topilmadi")
+
+    # requirements.txt joylashgan papkada virtual muhit yaratib, kutubxonalarni
+    # o'rnatamiz. Django check/migrate/collectstatic shu venv python bilan ishlaydi.
+    venv_result = ensure_virtualenv(base_root)
+    if not venv_result["status"]:
+        return venv_result
+
+    python_bin = venv_result["python_bin"]
+    project["python_bin"] = python_bin
+    project["gunicorn_bin"] = venv_result["gunicorn_bin"]
+    project["venv_dir"] = venv_result["venv_dir"]
+    venv_logs = venv_result.get("logs", [])
+    if project.get("env_created"):
+        venv_logs = venv_logs + [f"✅ .env fayli .env.example dan yaratildi: {project['env_file']}"]
 
     check_result = run_command(
         [python_bin, "manage.py", "check"],
@@ -693,6 +859,10 @@ def prepare_backend_project(path: str):
     database_engine = (settings_data.get("database_engine") or "").lower()
     database_name = settings_data.get("database_name") or ""
 
+    # Websocket / ASGI aniqlash: settings dagi ASGI_APPLICATION yoki channels/daphne
+    # bo'lsa hamda asgi.py fayli mavjud bo'lsa, ASGI rejimida deploy qilamiz.
+    is_asgi = bool(settings_data.get("is_asgi")) and bool(project.get("asgi_file"))
+
     if not static_root:
         return build_result(False, "❌ settings.py da STATIC_ROOT topilmadi")
 
@@ -717,8 +887,11 @@ def prepare_backend_project(path: str):
         f"STATIC_URL: {static_url}",
         f"MEDIA_URL: {media_url}",
         f"Database engine: {database_engine}",
-        f"WSGI/ASGI: {project['wsgi_module']}",
+        f"Rejim: {'ASGI/websocket (' + project.get('asgi_module', '') + ')' if is_asgi else 'WSGI (' + project['wsgi_module'] + ')'}",
     ]
+
+    if is_asgi:
+        checks.append("🔌 Websocket (ASGI) aniqlandi — uvicorn worker va nginx upgrade sozlamalari ishlatiladi")
 
     sqlite_path = ""
     if "sqlite" in database_engine:
@@ -740,6 +913,8 @@ def prepare_backend_project(path: str):
         settings=settings_data,
         checks=checks,
         sqlite_path=sqlite_path,
+        is_asgi=is_asgi,
+        venv_logs=venv_logs,
     )
 
 
@@ -758,7 +933,30 @@ def check_backend_path(path: str):
     )
 
 
-def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path: str):
+# Websocket (ASGI) rejimida location / ichiga qo'shiladigan upgrade sozlamalari
+WEBSOCKET_PROXY_BLOCK = (
+    "        proxy_http_version 1.1;\n"
+    "        proxy_set_header Upgrade $http_upgrade;\n"
+    "        proxy_set_header Connection $connection_upgrade;\n"
+    "        proxy_read_timeout 86400;"
+)
+
+
+def ensure_websocket_map():
+    """
+    $connection_upgrade map ni http kontekstiga bir marta yozadi. Har bir sayt
+    configida takrorlanmasligi uchun alohida global faylda saqlanadi.
+    """
+    map_config = (
+        "map $http_upgrade $connection_upgrade {\n"
+        "    default upgrade;\n"
+        "    ''      close;\n"
+        "}\n"
+    )
+    return save_text_file("/etc/nginx/conf.d/websocket_upgrade.conf", map_config)
+
+
+def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path: str, is_asgi: bool = False):
     template = read_template("backend.conf")
 
     if template is None:
@@ -769,6 +967,7 @@ def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path:
     static_url = settings_data.get("static_url") or "/static/"
     media_url = settings_data.get("media_url") or "/media/"
     upstream_name = service_name_for_domain(domain)
+    websocket_proxy = WEBSOCKET_PROXY_BLOCK if is_asgi else ""
 
     config = template.replace("{{DOMAIN}}", domain)
     config = config.replace("{{STATIC_ROOT}}", static_root)
@@ -777,29 +976,48 @@ def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path:
     config = config.replace("{{MEDIA_URL}}", media_url)
     config = config.replace("{{UPSTREAM_NAME}}", upstream_name)
     config = config.replace("{{SOCKET_PATH}}", socket_path)
+    config = config.replace("{{WEBSOCKET_PROXY}}", websocket_proxy)
 
     return build_result(True, "Nginx config tayyor", config=config)
 
 
-def generate_backend_service_config(domain: str, project: dict, socket_path: str):
+def build_exec_start(project: dict, socket_path: str, is_asgi: bool):
+    gunicorn_bin = project.get("gunicorn_bin") or "gunicorn"
+    project_root = project.get("project_root") or ""
+
+    if is_asgi and project.get("asgi_module"):
+        module = project["asgi_module"]
+        return (
+            f"{gunicorn_bin} --chdir {project_root} "
+            f"--workers 3 --worker-class uvicorn.workers.UvicornWorker "
+            f"--bind unix:{socket_path} {module}:application"
+        )
+
+    module = project.get("wsgi_module") or ""
+    return (
+        f"{gunicorn_bin} --chdir {project_root} "
+        f"--workers 3 --bind unix:{socket_path} {module}:application"
+    )
+
+
+def generate_backend_service_config(domain: str, project: dict, socket_path: str, is_asgi: bool = False):
     template = read_template("backend.service")
 
     if template is None:
         return build_result(False, "backend.service topilmadi")
 
     env_file = project.get("env_file") or ""
-    python_bin = project.get("python_bin") or shutil.which("python3") or "python3"
-    wsgi_module = project.get("wsgi_module") or ""
     project_root = project.get("project_root") or ""
     service_name = service_name_for_domain(domain)
+    env_file_line = f"EnvironmentFile={env_file}" if env_file else ""
+    exec_start = build_exec_start(project, socket_path, is_asgi)
 
     config = template.replace("{{DOMAIN}}", domain)
     config = config.replace("{{SERVICE_NAME}}", service_name)
     config = config.replace("{{PROJECT_ROOT}}", project_root)
-    config = config.replace("{{PYTHON_BIN}}", python_bin)
-    config = config.replace("{{WSGI_MODULE}}", wsgi_module)
+    config = config.replace("{{ENV_FILE_LINE}}", env_file_line)
+    config = config.replace("{{EXEC_START}}", exec_start)
     config = config.replace("{{SOCKET_PATH}}", socket_path)
-    config = config.replace("{{ENV_FILE}}", env_file)
 
     return build_result(True, "Systemd service tayyor", config=config)
 
@@ -940,6 +1158,87 @@ def check_site_status(domain: str):
         }
 
 
+def ensure_certbot():
+    if shutil.which("certbot"):
+        return build_result(True, "certbot mavjud")
+
+    run_command(["apt-get", "update"], timeout=300)
+    install = run_command(
+        ["apt-get", "install", "-y", "certbot", "python3-certbot-nginx"],
+        timeout=900,
+    )
+
+    if shutil.which("certbot"):
+        return build_result(True, "certbot o'rnatildi")
+
+    return build_result(
+        False,
+        "certbot o'rnatilmadi",
+        stderr=install["stderr"],
+        stdout=install["stdout"],
+    )
+
+
+def obtain_ssl_certificate(domain: str):
+    """
+    Domainga Let's Encrypt SSL sertifikat oladi va nginx ni HTTPS ga o'tkazadi.
+    HTTP dan HTTPS ga avtomatik redirect qo'shiladi. Xatolik bo'lsa deploy
+    to'xtamaydi — sayt HTTP da ishlayveradi.
+    """
+    ready = ensure_certbot()
+    if not ready["status"]:
+        return ready
+
+    args = [
+        "certbot", "--nginx",
+        "-d", domain,
+        "--non-interactive",
+        "--agree-tos",
+        "--redirect",
+    ]
+
+    # www subdomeni serverga ulangan bo'lsagina sertifikatga qo'shamiz
+    www_domain = f"www.{domain}"
+    if resolve_domain(www_domain).get("status"):
+        args += ["-d", www_domain]
+
+    if LETSENCRYPT_EMAIL:
+        args += ["-m", LETSENCRYPT_EMAIL]
+    else:
+        args += ["--register-unsafely-without-email"]
+
+    result = run_command(args, timeout=300)
+    if not result["success"]:
+        return build_result(
+            False,
+            "SSL sertifikat olinmadi",
+            stderr=result["stderr"],
+            stdout=result["stdout"],
+        )
+
+    return build_result(True, "SSL sertifikat o'rnatildi va HTTPS yoqildi")
+
+
+def apply_ssl_and_finalize(domain: str, logs: list, **extra):
+    """Muvaffaqiyatli deploy so'ngida SSL o'rnatib, yakuniy natijani qaytaradi."""
+    ssl_result = obtain_ssl_certificate(domain)
+    if ssl_result["status"]:
+        logs.append("🔒 SSL sertifikat o'rnatildi (HTTPS)")
+        url = f"https://{domain}"
+    else:
+        logs.append(f"⚠️ SSL o'rnatilmadi: {ssl_result['msg']} (sayt HTTP da ishlayapti)")
+        url = f"http://{domain}"
+
+    return build_result(
+        True,
+        "Django backend deploy yakunlandi",
+        logs=logs,
+        url=url,
+        ssl=ssl_result["status"],
+        **extra,
+    )
+
+
 def deploy_backend(path: str, domain: str):
     logs = []
     domain = (domain or "").strip()
@@ -953,6 +1252,7 @@ def deploy_backend(path: str, domain: str):
 
     project = prepared["project"]
     settings_data = prepared["settings"]
+    is_asgi = prepared.get("is_asgi", False)
     project_root = project["project_root"]
     python_bin = project["python_bin"]
     static_root = settings_data["static_root"]
@@ -975,17 +1275,9 @@ def deploy_backend(path: str, domain: str):
     ensure_directory(static_root)
     ensure_directory(media_root)
 
+    # Virtual muhit va .env tayyorlash loglari
+    logs.extend(prepared.get("venv_logs", []))
     logs.append("✅ Django project tekshiruvdan o'tdi")
-
-    permission_check = diagnose_backend_permissions(project_root, static_root, media_root)
-    if not permission_check["status"]:
-        logs.append("⚠️ Permission muammosi aniqlandi, tuzatilmoqda")
-        fix_result = fix_backend_permissions(project_root, static_root, media_root)
-        if not fix_result["status"]:
-            return build_result(False, fix_result["msg"], logs=logs + fix_result.get("logs", []))
-
-        logs.extend(fix_result.get("logs", []))
-        logs.append("✅ Permissionlar tuzatildi")
 
     migrate_result = migrate_database(project_root, python_bin)
     if not migrate_result["success"]:
@@ -1013,11 +1305,23 @@ def deploy_backend(path: str, domain: str):
 
     logs.append("✅ collectstatic bajarildi")
 
-    nginx_result = generate_backend_nginx_config(domain, settings_data, socket_path)
+    # migrate/collectstatic root sifatida ishlaydi, shuning uchun kod, venv,
+    # static/media va DB fayllarini www-data egaligiga o'tkazamiz
+    fix_result = fix_backend_permissions(project_root, static_root, media_root)
+    if fix_result["status"]:
+        logs.append("✅ Fayl huquqlari www-data uchun sozlandi")
+    else:
+        logs.append(f"⚠️ Permission sozlashda muammo: {fix_result['msg']}")
+
+    if is_asgi:
+        ensure_websocket_map()
+        logs.append("🔌 Websocket (ASGI) rejimi: nginx upgrade map yozildi")
+
+    nginx_result = generate_backend_nginx_config(domain, settings_data, socket_path, is_asgi)
     if not nginx_result["success"]:
         return build_result(False, nginx_result["msg"], logs=logs)
 
-    service_result = generate_backend_service_config(domain, project, socket_path)
+    service_result = generate_backend_service_config(domain, project, socket_path, is_asgi)
     if not service_result["success"]:
         return build_result(False, service_result["msg"], logs=logs)
 
@@ -1093,11 +1397,9 @@ def deploy_backend(path: str, domain: str):
     site_result = check_site_status(domain)
     if site_result.get("success"):
         logs.append("✅ Django backend muvaffaqiyatli ishga tushdi")
-        return build_result(
-            True,
-            "Django backend deploy yakunlandi",
-            logs=logs,
-            url=f"http://{domain}",
+        return apply_ssl_and_finalize(
+            domain,
+            logs,
             service_name=service_name,
             site_config=site_config_path,
             service_file=service_file_path,
@@ -1118,11 +1420,9 @@ def deploy_backend(path: str, domain: str):
                 site_result = check_site_status(domain)
                 if site_result.get("success"):
                     logs.append("✅ Sayt qayta tekshiruvdan o'tdi")
-                    return build_result(
-                        True,
-                        "Django backend deploy yakunlandi",
-                        logs=logs,
-                        url=f"http://{domain}",
+                    return apply_ssl_and_finalize(
+                        domain,
+                        logs,
                         service_name=service_name,
                     )
 

@@ -1,0 +1,19 @@
+[Unit]
+Description=Django backend ({{SERVICE_NAME}}) for {{DOMAIN}}
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+RuntimeDirectory={{SERVICE_NAME}}
+WorkingDirectory={{PROJECT_ROOT}}
+{{ENV_FILE_LINE}}
+ExecStart={{EXEC_START}}
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
