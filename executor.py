@@ -1032,6 +1032,33 @@ def ensure_websocket_map():
     return save_text_file("/etc/nginx/conf.d/websocket_upgrade.conf", map_config)
 
 
+def build_static_location(url: str, root: str):
+    """
+    static/media uchun nginx `location` bloki quradi. Agar url `/`, bo'sh yoki
+    tashqi URL (CDN) bo'lsa — asosiy `location /` bilan to'qnashmasligi uchun
+    hech narsa qaytarmaydi (aks holda 'duplicate location /' xatosi chiqadi).
+    """
+    url = (url or "").strip()
+    root = (root or "").strip().rstrip("/")
+
+    if not url or not root:
+        return ""
+
+    if not url.startswith("/"):
+        url = "/" + url
+
+    if url == "/" or "://" in url:
+        return ""
+
+    return (
+        f"    location {url} {{\n"
+        f"        alias {root}/;\n"
+        f"        access_log off;\n"
+        f"        expires 30d;\n"
+        f"    }}\n\n"
+    )
+
+
 def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path: str, is_asgi: bool = False):
     template = read_template("backend.conf")
 
@@ -1040,16 +1067,17 @@ def generate_backend_nginx_config(domain: str, settings_data: dict, socket_path:
 
     static_root = settings_data.get("static_root") or ""
     media_root = settings_data.get("media_root") or ""
-    static_url = settings_data.get("static_url") or "/static/"
-    media_url = settings_data.get("media_url") or "/media/"
+    static_url = settings_data.get("static_url") or ""
+    media_url = settings_data.get("media_url") or ""
     upstream_name = service_name_for_domain(domain)
     websocket_proxy = WEBSOCKET_PROXY_BLOCK if is_asgi else ""
 
+    static_location = build_static_location(static_url, static_root)
+    media_location = build_static_location(media_url, media_root)
+
     config = template.replace("{{DOMAIN}}", domain)
-    config = config.replace("{{STATIC_ROOT}}", static_root)
-    config = config.replace("{{MEDIA_ROOT}}", media_root)
-    config = config.replace("{{STATIC_URL}}", static_url)
-    config = config.replace("{{MEDIA_URL}}", media_url)
+    config = config.replace("{{STATIC_LOCATION}}", static_location)
+    config = config.replace("{{MEDIA_LOCATION}}", media_location)
     config = config.replace("{{UPSTREAM_NAME}}", upstream_name)
     config = config.replace("{{SOCKET_PATH}}", socket_path)
     config = config.replace("{{WEBSOCKET_PROXY}}", websocket_proxy)
