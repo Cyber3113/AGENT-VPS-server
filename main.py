@@ -19,8 +19,8 @@ BACKEND_URL = "https://pre-hygiene-guy-dock.trycloudflare.com"
 def register():
     try:
         requests.post(f"{BACKEND_URL}/servers", json={
-            "name": "ubuntu server",
-            "ip": "151.247.208.29:9000"
+            "name": "foodly server",
+            "ip": "82.25.185.204:9000"
         })
         print("✅ Registered to backend")
     except Exception as e:
