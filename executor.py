@@ -1203,10 +1203,39 @@ def diagnose_backend_permissions(path: str, static_root: str, media_root: str):
     return build_result(True, "www-data pathlarni o'qiy oladi")
 
 
+def traverse_commands(*paths):
+    """
+    Berilgan pathlarning barcha ota-papkalariga `o+x` (traverse) huquqini
+    qo'shadigan chmod buyruqlarini qaytaradi. Bu www-data (systemd/nginx) user
+    home papkasi 750 bo'lsa ham (masalan /home/foodly) loyihaga yo'l ochilishini
+    ta'minlaydi — aks holda systemd `status=200/CHDIR` bilan qulaydi.
+    """
+    seen = set()
+    commands = []
+
+    for path in paths:
+        if not path:
+            continue
+
+        current = Path(path).resolve()
+        # path ning o'zi va barcha ota-papkalari (/ dan tashqari)
+        for directory in [current, *current.parents]:
+            key = str(directory)
+            if key == "/" or key in seen:
+                continue
+            seen.add(key)
+            if directory.exists():
+                commands.append(["chmod", "o+x", key])
+
+    return commands
+
+
 def fix_backend_permissions(path: str, static_root: str, media_root: str):
-    commands = [
-        ["chown", "-R", "www-data:www-data", path],
-    ]
+    # Avval loyiha va static/media yo'llariga www-data traverse qila olishini
+    # ta'minlaymiz (ota-papkalarga o+x)
+    commands = traverse_commands(path, static_root, media_root)
+
+    commands.append(["chown", "-R", "www-data:www-data", path])
 
     for extra_path in [static_root, media_root]:
         if extra_path and extra_path != path:
